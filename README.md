@@ -77,19 +77,226 @@ Then **assisted apply** (review mode) fills the form for you to submit. Each sta
 
 ---
 
+## Import jobs from your LinkedIn alerts (recommended over discovery)
+
+Board scraping (the `discover` stage) tends to return a lot of irrelevant, region-locked
+postings. If you already have **LinkedIn job alerts** emailed to you, those are curated, far
+higher-signal. `import-alerts` bypasses discovery: it reads your exported alert emails, pulls each
+posting straight from LinkedIn's guest API (title, company, **real location**, full description —
+no login), inserts them already-enriched, excludes region-locked ones, then scores and tailors the
+eligible ones.
+
+### Step 1 — get the alert emails in
+
+**Option A — pull straight from Gmail (recommended, no manual export):**
+
+Add a Gmail app password to `~/.applyassist/.env`, then let ApplyAssist read the alerts itself
+over IMAP — no clicking through emails one at a time.
+
+1. Enable 2-Step Verification on your Google account, then create an **app password** at
+   **[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)**.
+2. Add to `~/.applyassist/.env`:
+   ```
+   GMAIL_ADDRESS=you@gmail.com
+   GMAIL_APP_PASSWORD=abcd efgh ijkl mnop
+   ```
+3. Run:
+   ```bash
+   ./applyassist.sh import-alerts --from-gmail
+   ./applyassist.sh import-alerts --from-gmail --gmail-days 14   # only recent alerts
+   ```
+
+This searches Gmail for LinkedIn job alerts, downloads each one, extracts every job link, and
+imports them — whether that's 5 emails or 500. Nothing is sent anywhere; it's a read-only IMAP
+connection to your own mailbox. Override the search with `--gmail-query` (Gmail search syntax).
+
+**Option B — export the emails yourself, then hand the file to ApplyAssist (no account connection):**
+
+If you'd rather not give the tool IMAP access, export your alerts yourself and point it at the
+file(s). `.eml`, `.mbox`, and raw `.html`/`.txt` are all supported, and `--from-files` accepts
+either a **single file** or a **folder** — so one big `.mbox` of 1,000 emails works as-is.
+
+*A few emails — download individually:*
+1. In Gmail (web), open a LinkedIn job-alert email.
+2. Click **⋮ (More) → Download message** and save the `.eml` into `~/.applyassist/inbox/`
+   (`open ~/.applyassist/inbox` on macOS). Repeat for each one.
+
+*Hundreds/thousands — bulk export to one `.mbox` via Google Takeout (recommended for big batches):*
+1. In Gmail (web), gather your alerts under one label first — Takeout exports Mail *by label*. Use a
+   **filter** to label the entire backlog in one shot (don't bother with select-all / the "select all
+   conversations" banner — it's unreliable in search views):
+   1. Click the **sliders/filter icon** at the right end of the Gmail search box.
+   2. In **From**, enter `jobalerts-noreply@linkedin.com` → click **Create filter** (bottom-right).
+   3. Tick **Apply the label** → **Choose label…** → **New label** → name it `Job Alerts` → **Create**.
+   4. Tick **Also apply filter to matching conversations** (this labels the existing backlog, not just
+      future mail).
+   5. Click **Create filter**.
+2. Go to **[takeout.google.com](https://takeout.google.com)** → **Deselect all** → scroll to
+   **Mail** and tick it.
+3. Click **All Mail data included** under Mail → **Deselect all** → tick only **`Job Alerts`** →
+   **OK**.
+4. Click **Next step** → keep *"Send download link via email"*, **Export once**, `.zip` → **Create
+   export**. Google emails you a download link (usually minutes; can be longer for large mailboxes).
+5. Download and unzip. Inside `Takeout/Mail/` you'll find **`Job Alerts.mbox`**.
+6. **macOS:** move the `.mbox` out of `Downloads` before importing. `Downloads`, `Desktop`, and
+   `Documents` are protected by macOS privacy (TCC), and the terminal can't read files there without
+   Full Disk Access — you'll get `Operation not permitted`. In **Finder**, drag the file into a plain
+   folder like `~/jobs-import/` (any name other than those three). Then import:
+   ```bash
+   ./applyassist.sh import-alerts --from-files ~/jobs-import/"Job Alerts.mbox"
+   ```
+   (Alternatively, grant your terminal app **Full Disk Access** in System Settings → Privacy &
+   Security and restart it — then any path works. Or just use `--from-gmail` and skip files entirely.)
+
+*Alternative — export from a desktop mail client:* In **Apple Mail** select the alert messages →
+**Mailbox → Export Mailbox…** (produces an `.mbox`). In **Thunderbird** (with the *ImportExportTools NG*
+add-on) select the folder → **Export folder** → `.mbox`. Then point `--from-files` at that file.
+
+### Step 2 — import (Option B)
+
+If you dropped files into the default inbox, just run:
+
+```bash
+cd ~/Documents/ApplyAssist
+./applyassist.sh import-alerts
+```
+
+That extracts every job link, fetches each posting, classifies eligibility, and — by default —
+scores + tailors the eligible jobs. Useful flags (apply to `--from-gmail` and file imports alike):
+
+```bash
+./applyassist.sh import-alerts --no-run                          # import only; score later yourself
+./applyassist.sh import-alerts --limit 20                        # cap how many new jobs to pull
+./applyassist.sh import-alerts --from-files "~/Downloads/Job Alerts.mbox"   # a single exported file
+./applyassist.sh import-alerts --from-files ~/Downloads/alerts   # or a folder of files
+```
+
+> Importing 1,000 alerts fetches each posting from LinkedIn with a ~1s pause between calls (to stay
+> polite / avoid rate limits), so a large batch can take a while. De-duplication is automatic —
+> jobs already in your DB are skipped — so you can re-run safely, and `--limit` caps a first pass.
+
+### Step 3 — review and apply
+
+First look at what the pipeline produced, then apply:
+
+```bash
+./applyassist.sh dashboard      # see the imported jobs, scores, and location tags
+```
+
+In the dashboard, each scored job card shows the **real employer** (with "via LinkedIn"), the fit
+score, and — once assets exist — buttons to work the application by hand:
+
+- **⚡ Apply** — opens an **Apply Focus** panel: the live posting + both PDFs one click away, plus
+  one-click **Copy** buttons for every field forms ask for (name, email, phone, LinkedIn, salary in
+  USD/PKR — yearly and monthly, work-authorization answer, and the on-disk PDF paths), and the full
+  cover-letter text. Fill the real form by pasting, submit there, then hit **✓ Applied**.
+- **📄 Résumé** / **✉️ Cover letter** — open the tailored documents for *that specific posting*.
+- **✓ Mark applied** — marks a job done so it drops off every working view (reversible under the
+  **Total** tile).
+
+The stat tiles at the top (Total / Scored / Strong 7+ / Ready / Excluded) are clickable filters,
+and the list is paginated. For an offline overview, `applyassist manifest` writes a CSV mapping
+every job to its company, score, URL, and résumé/cover file paths.
+
+Then apply. There are three modes:
+
+| You want to… | Command | What it does |
+|---|---|---|
+| **Apply to one specific posting** | `./applyassist.sh apply --url "<job url>"` | Prepares that exact job. Get the URL from the dashboard's "Open posting" link. |
+| **Apply to one job at a time** (default) | `./applyassist.sh apply` | Picks your single highest-fit prepared job, opens the browser, fills it, stops for you to submit. |
+| **Work through many in bulk** | `./applyassist.sh apply --limit 10` | Prepares up to 10 in this run, one after another — it opens each, you review + submit, then it moves to the next. Add `--continuous` to keep going as more become ready. |
+
+In every mode it stops before Submit and hands you the browser — **you click Submit**. A daily cap
+(default 30, `APPLYASSIST_DAILY_CAP`) limits how many it prepares in a rolling 24h window. After you
+submit (or if you do one manually), record it: `./applyassist.sh apply --mark-applied "<job url>"`.
+
+**Notes**
+- The location guardrail still applies — alert jobs that are US-only / region-locked (and you're
+  not eligible for) are auto-excluded so you don't waste time on them. Toggle "show excluded" in
+  the dashboard to see them with the reason.
+- **Want region-locked roles anyway?** Add `--include-region-locked` to `import-alerts` to keep and
+  process them (they're tagged `override` instead of being excluded). Already imported and excluded
+  them? Un-exclude with `./applyassist.sh include-region-locked` (add `--today` and/or
+  `--strategy linkedin_alert` to scope it, and `--run` to score them right away).
+- Re-running `import-alerts` on the same emails is safe — already-imported jobs are skipped (dedup).
+- LinkedIn may rate-limit large batches; the importer paces itself and skips any posting it can't
+  fetch (expired/removed), without failing the run.
+
+---
+
 ## Requirements
 
 | Component | Required for | Details |
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier is enough — get one at [aistudio.google.com](https://aistudio.google.com) |
+| An LLM API key | Scoring, tailoring, cover letters | Any OpenAI-compatible provider. Free tiers are enough — see [LLM providers](#llm-providers-free-options--auto-rotation) |
 | Node.js 18+ | Assisted apply | Needed for `npx` to run the Playwright MCP server |
 | Chrome/Chromium | Assisted apply | Auto-detected on most systems |
 | Claude Code CLI | Assisted apply | Install from [claude.ai/code](https://claude.ai/code) |
 
-OpenAI and local models (Ollama/llama.cpp) are also supported.
+Gemini, OpenAI, Cerebras, Groq, Mistral, NVIDIA NIM, and local models (Ollama/llama.cpp)
+are all supported — anything that speaks the OpenAI chat-completions API.
 
 There is **no CAPTCHA-solver dependency** — that was removed by design.
+
+---
+
+## LLM providers (free options + auto-rotation)
+
+Every AI stage (score, tailor, cover) talks to an OpenAI-compatible chat API, so you can use
+any provider — and mix them per stage. Configure each provider **once** in `~/.applyassist/.env`
+as a named block, pick a default with `LLM_PROVIDER`, and switch per run with flags (no `.env`
+edits needed):
+
+```
+LLM_PROVIDER=cerebras                              # default provider when no --provider is passed
+
+LLM_URL_CEREBRAS=https://api.cerebras.ai/v1
+LLM_API_KEY_CEREBRAS=...
+LLM_MODEL_CEREBRAS=gpt-oss-120b
+
+LLM_URL_GROQ=https://api.groq.com/openai/v1
+LLM_API_KEY_GROQ=...
+LLM_MODEL_GROQ=llama-3.1-8b-instant
+
+LLM_URL_MISTRAL=https://api.mistral.ai/v1
+LLM_API_KEY_MISTRAL=...
+LLM_MODEL_MISTRAL=mistral-large-latest
+```
+
+```bash
+applyassist run score tailor cover pdf --provider cerebras
+# chain several free providers — auto-rotates to the next when one hits its daily limit:
+applyassist run score tailor cover pdf --provider cerebras,groq,gemini --auto-resume
+# a different model per stage (cheap bulk scoring, best writer for covers):
+applyassist run score tailor cover pdf --score-provider groq --tailor-provider cerebras --cover-provider mistral
+# work in small batches so ready-to-apply jobs come out fast:
+applyassist run score tailor cover pdf --batch 5 --auto-resume
+```
+
+| Flag | What it does |
+|------|-------------|
+| `--provider NAME` | Default provider for all LLM stages this run (overrides `LLM_PROVIDER`). A **comma list** (`a,b,c`) auto-rotates to the next when one is rate-limited or exhausted. |
+| `--score-provider` / `--tailor-provider` / `--cover-provider` | Override a single stage (each also accepts a comma chain). |
+| `--auto-resume` | On a rate-limit/quota halt, sleep and resume instead of stopping — lets a big batch run unattended on free tiers. `--resume-wait SECONDS` tunes the pause. |
+| `--batch N` | Score until N eligible jobs are ready, push that batch through tailor → cover → pdf, repeat. |
+
+The bare `GEMINI_API_KEY` / `OPENAI_API_KEY` / `LLM_URL` config still works as a fallback.
+Generous **no-credit-card** free tiers (2026): **Cerebras** (~1M tokens/day), **Groq** (fast,
+14k req/day on small models), **Mistral La Plateforme** (~1B tokens/month), **Google AI Studio**
+(1,500 req/day).
+
+### Quality guardrails (tailoring & cover letters)
+
+- **No fabricated numbers.** A validator extracts the real metrics from your base résumé and
+  rejects any percentage/figure the LLM didn't take from it — including numbers echoed from the
+  job description.
+- **Real employer, not the board.** The hiring company is recovered from each posting's
+  description (LinkedIn jobs only carry the board name), so cover letters address the actual
+  company — never "LinkedIn."
+- **Unique files per job.** Résumé/cover filenames include the job ID, so same-title postings
+  never overwrite each other.
+- **One page, single column, ATS-clean** PDFs (auto-fit to fill exactly one page).
 
 ---
 
@@ -108,11 +315,25 @@ The capability tiers (`applyassist doctor` shows yours) describe what your *loca
 ```
 applyassist init                        # First-time setup wizard
 applyassist doctor                      # Verify setup, diagnose missing requirements
+applyassist import-alerts               # Import jobs from exported LinkedIn alert emails (~/.applyassist/inbox), then score+tailor
+applyassist import-alerts --from-gmail  # Pull alerts straight from Gmail over IMAP (no manual export)
+applyassist import-alerts --no-run      # Import only (don't auto-score)
+applyassist import-alerts --include-region-locked   # Keep region-locked roles and process them too
+applyassist include-region-locked       # Un-exclude region-locked jobs already in the DB (see flags below)
+applyassist include-region-locked --today --strategy linkedin_alert --run   # …scoped, then re-run the pipeline
 applyassist run [stages...]             # Run pipeline stages (discover enrich score tailor cover pdf, or 'all')
+applyassist run score tailor cover pdf  # Re-process eligible jobs without re-scraping (e.g. after un-excluding)
 applyassist run --workers 4             # Parallel discovery/enrichment
 applyassist run --min-score 8           # Override score threshold
-applyassist apply                       # REVIEW MODE: fill the form, stop for you to submit (default)
-applyassist apply --url URL             # Prepare a specific job
+applyassist run --provider cerebras,groq            # Pick provider(s); comma chain auto-rotates on rate limits
+applyassist run --score-provider groq --cover-provider mistral   # Different model per stage
+applyassist run --auto-resume           # Sleep & resume on rate-limit halts (free-tier friendly)
+applyassist run --batch 5               # Process in batches of 5 (score → tailor → cover → pdf, repeat)
+applyassist manifest                    # Write applications.csv mapping each job to its résumé/cover files
+applyassist apply                       # REVIEW MODE: prepare ONE highest-fit job, stop for you to submit (default)
+applyassist apply --limit 10            # Prepare up to 10 applications this run (bulk)
+applyassist apply --continuous          # Keep preparing as new jobs become ready (respects daily cap)
+applyassist apply --url URL             # Prepare a specific job (single listing)
 applyassist apply --autopilot           # Opt-in: also clicks Submit (confirmation required)
 applyassist apply --mark-applied URL    # Mark a job applied after you submitted it
 applyassist apply --mark-failed URL     # Mark a job failed

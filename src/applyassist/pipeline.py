@@ -13,6 +13,7 @@ Usage (via CLI):
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from datetime import datetime
@@ -96,6 +97,31 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    # Guardrails: exclude region-locked roles and keyword-blocklisted ones right
+    # after discovery, so the dashboard reflects an eligible-only list immediately
+    # (re-applied before scoring once descriptions are enriched).
+    try:
+        from applyassist.config import load_exclusions
+        from applyassist.database import apply_blocklist
+        from applyassist.filters import classify_jobs, ELIGIBLE_STATUSES
+        bl = load_exclusions()
+        n_bl = apply_blocklist(bl["title_contains"], bl["company_contains"])
+        counts = classify_jobs()  # uses the descriptions the scrapers already fetched
+        eligible = sum(counts.get(s, 0) for s in ELIGIBLE_STATUSES)
+        locked = counts.get("region_locked", 0)
+        unknown = counts.get("unknown", 0)
+        console.print(
+            f"  [dim]Classified new jobs: {eligible} eligible, {locked} region-locked "
+            f"(excluded), {unknown} unknown (parked). Blocklist excluded {n_bl}.[/dim]"
+        )
+        console.print(
+            f"  [dim]Only the {eligible} eligible will be scored/tailored — "
+            f"unknown jobs are visible in the dashboard; use 'Enrich' to process one.[/dim]"
+        )
+        stats["classified"] = counts
+    except Exception as e:
+        log.error("Guardrail classification failed: %s", e)
+
     return stats
 
 
@@ -110,34 +136,53 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_score() -> dict:
+def _run_score(score_model: str | None = None, score_provider: str | None = None) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     try:
         from applyassist.scoring.scorer import run_scoring
-        run_scoring()
+        result = run_scoring(model=score_model, provider=score_provider)
+        # run_scoring checkpoints per-job and returns a 'halted' status if the
+        # provider cut us off (quota/connection). Pass that through so the
+        # pipeline can stop cleanly instead of marching into tailor/cover.
+        if isinstance(result, dict) and result.get("halted"):
+            return result
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_tailor(min_score: int = 7, validation_mode: str = "normal",
+                tailor_provider: str | None = None) -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
+    from applyassist.llm import LLMHaltError
     try:
         from applyassist.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        run_tailoring(min_score=min_score, validation_mode=validation_mode,
+                      provider=tailor_provider)
         return {"status": "ok"}
+    except LLMHaltError as e:
+        return {"status": "halted: rate_limit", "halted": "rate_limit",
+                "resume_hint": e.resume_hint,
+                "message": f"Tailoring stopped: {e}. Progress saved — {e.resume_hint}."}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_cover(min_score: int = 7, validation_mode: str = "normal",
+               cover_provider: str | None = None) -> dict:
     """Stage: Cover letter generation."""
+    from applyassist.llm import LLMHaltError
     try:
         from applyassist.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
+        run_cover_letters(min_score=min_score, validation_mode=validation_mode,
+                          provider=cover_provider)
         return {"status": "ok"}
+    except LLMHaltError as e:
+        return {"status": "halted: rate_limit", "halted": "rate_limit",
+                "resume_hint": e.resume_hint,
+                "message": f"Cover letters stopped: {e}. Progress saved — {e.resume_hint}."}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
         return {"status": f"error: {e}"}
@@ -324,11 +369,22 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
-    """Execute stages one at a time (original behavior)."""
+                    validation_mode: str = "normal",
+                    auto_resume: bool = False, resume_wait: int = 120,
+                    score_model: str | None = None,
+                    score_provider: str | None = None,
+                    tailor_provider: str | None = None,
+                    cover_provider: str | None = None) -> dict:
+    """Execute stages one at a time (original behavior).
+
+    With auto_resume, a stage that halts on a rate limit is slept on and re-run
+    (it resumes from its per-job checkpoint) until it finishes or stops making
+    progress — so a large batch can run unattended on a free-tier API.
+    """
     results: list[dict] = []
     errors: dict[str, str] = {}
     pipeline_start = time.time()
+    _MAX_STALL = 5  # consecutive no-progress resumes before giving up
 
     for name in ordered:
         meta = STAGE_META[name]
@@ -337,35 +393,76 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
         console.print(f"  Started: {datetime.now().strftime('%H:%M:%S')}")
         console.print(f"{'=' * 70}")
 
-        t0 = time.time()
         runner = _STAGE_RUNNERS[name]
+        kwargs: dict = {}
+        if name in ("tailor", "cover"):
+            kwargs["min_score"] = min_score
+            kwargs["validation_mode"] = validation_mode
+        if name in ("discover", "enrich"):
+            kwargs["workers"] = workers
+        if name == "score":
+            kwargs["score_model"] = score_model
+            kwargs["score_provider"] = score_provider
+        if name == "tailor":
+            kwargs["tailor_provider"] = tailor_provider
+        if name == "cover":
+            kwargs["cover_provider"] = cover_provider
 
-        try:
-            kwargs: dict = {}
-            if name in ("tailor", "cover"):
-                kwargs["min_score"] = min_score
-                kwargs["validation_mode"] = validation_mode
-            if name in ("discover", "enrich"):
-                kwargs["workers"] = workers
-            result = runner(**kwargs)
-            elapsed = time.time() - t0
+        stall = 0
+        while True:
+            pending_before = _count_pending(name, min_score) if name in _PENDING_SQL else None
+            t0 = time.time()
+            halt_reason = None
+            try:
+                result = runner(**kwargs)
+                elapsed = time.time() - t0
+                status = "ok"
+                halt_message = None
+                if isinstance(result, dict):
+                    status = result.get("status", "ok")
+                    halt_reason = result.get("halted")
+                    if halt_reason:
+                        halt_message = result.get("message", "Stopped: LLM provider unavailable.")
+                    if name == "discover":
+                        sub_errors = [
+                            f"{k}: {v}" for k, v in result.items()
+                            if isinstance(v, str) and v.startswith("error")
+                        ]
+                        if sub_errors:
+                            status = "partial"
+            except Exception as e:
+                elapsed = time.time() - t0
+                status = f"error: {e}"
+                halt_message = None
+                log.exception("Stage '%s' crashed", name)
+                console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
 
-            status = "ok"
-            if isinstance(result, dict):
-                status = result.get("status", "ok")
-                if name == "discover":
-                    sub_errors = [
-                        f"{k}: {v}" for k, v in result.items()
-                        if isinstance(v, str) and v.startswith("error")
-                    ]
-                    if sub_errors:
-                        status = "partial"
-
-        except Exception as e:
-            elapsed = time.time() - t0
-            status = f"error: {e}"
-            log.exception("Stage '%s' crashed", name)
-            console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
+            # Auto-resume only on a rate-limit halt; sleep and retry the same
+            # (checkpointed) stage. Bail if it stops making progress.
+            if not (halt_message and auto_resume and halt_reason == "rate_limit"):
+                break
+            progressed = True
+            pend_now = None
+            if pending_before is not None:
+                pend_now = _count_pending(name, min_score)
+                progressed = pend_now < pending_before
+            stall = 0 if progressed else stall + 1
+            if stall >= _MAX_STALL:
+                console.print(
+                    f"  [red]Auto-resume made no progress after {_MAX_STALL} tries "
+                    f"(quota likely exhausted for now). Stopping.[/red]"
+                )
+                break
+            remaining = f" (~{pend_now} left)" if pend_now is not None else ""
+            console.print(
+                f"  [yellow]⏳ Rate limited — auto-resuming '{name}' in {resume_wait}s{remaining}. "
+                f"Progress is saved.[/yellow]"
+            )
+            try:
+                time.sleep(resume_wait)
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted during wait — stopping.[/yellow]")
+                break
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
         if status not in ("ok", "partial"):
@@ -373,8 +470,148 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
         console.print(f"\n  Stage '{name}' completed in {elapsed:.1f}s — {status}")
 
+        # If a stage halted due to LLM quota/connection limits, stop the whole
+        # pipeline here — downstream LLM stages would just hit the same wall.
+        # Progress is already checkpointed, so the next run resumes cleanly.
+        if halt_message:
+            # The correct resume command continues from the halted stage onward
+            # (NOT bare `run`, which would re-scrape from discover). Drop discover
+            # /enrich so resume never re-scrapes — the data is already in the DB.
+            resume_stages = [s for s in ordered[ordered.index(name):]
+                             if s not in ("discover", "enrich")] or [name]
+            resume_cmd = "./applyassist.sh run " + " ".join(resume_stages)
+            console.print(Panel(
+                f"[bold yellow]Paused — LLM quota/limit reached.[/bold yellow]\n\n"
+                f"{halt_message}\n\n"
+                f"[bold]To resume[/bold] (continues where it stopped, no re-scraping):\n"
+                f"   [bold cyan]{resume_cmd}[/bold cyan]\n\n"
+                f"[dim]Do NOT use bare `./applyassist.sh run` — that restarts discovery "
+                f"from scratch.[/dim]",
+                title="⏸  Checkpoint saved",
+                border_style="yellow",
+            ))
+            break
+
     total_elapsed = time.time() - pipeline_start
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
+
+
+def _eligible_unscored() -> int:
+    """Count jobs that can still be scored (enriched, eligible, not yet scored)."""
+    return get_connection().execute(
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NULL "
+        "AND full_description IS NOT NULL AND COALESCE(excluded,0)=0 "
+        "AND location_status IN ('local','worldwide','relocation','override')"
+    ).fetchone()[0]
+
+
+def _run_batched(ordered: list[str], min_score: int, batch_size: int,
+                 validation_mode: str, auto_resume: bool, resume_wait: int,
+                 score_model: str | None, score_provider: str | None,
+                 tailor_provider: str | None, cover_provider: str | None) -> dict:
+    """Pipeline in small batches: score until `batch_size` eligible jobs are
+    ready, push that batch through tailor → cover → pdf, then repeat. Gets
+    ready-to-apply jobs out fast and keeps quota/memory bounded.
+    """
+    from applyassist.llm import LLMHaltError
+    from applyassist.scoring.scorer import run_scoring
+    from applyassist.scoring.tailor import run_tailoring
+    from applyassist.scoring.cover_letter import run_cover_letters
+    from applyassist.scoring.pdf import batch_convert
+
+    do = {s: (s in ordered) for s in STAGE_ORDER}
+    pipeline_start = time.time()
+    results: list[dict] = []
+
+    def stage(fn, label):
+        """Run a stage fn; on a rate-limit halt, sleep+retry if auto_resume.
+        Returns (ok, result_dict): ok=False means stop the whole run."""
+        stalls = 0
+        while not _stop_requested():
+            halted = hint = None
+            res = None
+            try:
+                res = fn()
+                if isinstance(res, dict) and res.get("halted"):
+                    halted, hint = True, res.get("resume_hint", "")
+            except LLMHaltError as e:
+                halted, hint = True, e.resume_hint
+            except Exception as e:
+                log.error("Batch stage '%s' error: %s", label, e)
+                return True, {}  # non-halt error: skip, keep going
+            if not halted:
+                return True, (res if isinstance(res, dict) else {})
+            if not auto_resume:
+                console.print(Panel(
+                    f"[yellow]Paused on '{label}' — rate limit/quota.[/yellow]\n{hint}\n\n"
+                    f"Re-run the same command to continue.",
+                    title="⏸  Checkpoint saved", border_style="yellow"))
+                return False, {}
+            stalls += 1
+            if stalls > 5:
+                console.print(f"  [red]'{label}' made no progress after 5 retries — stopping.[/red]")
+                return False, {}
+            console.print(f"  [yellow]⏳ '{label}' rate-limited — waiting {resume_wait}s...[/yellow]")
+            time.sleep(resume_wait)
+        return False, {}
+
+    batch_no = 0
+    while True:
+        # 1. If scoring, score until a batch of eligible jobs is ready (or done).
+        if do["score"]:
+            guard = 0
+            while _count_pending("tailor", min_score) < batch_size and _eligible_unscored() > 0:
+                ok, _ = stage(lambda: run_scoring(limit=batch_size, model=score_model,
+                                                  provider=score_provider), "score")
+                if not ok:
+                    return {"stages": results, "errors": {}, "elapsed": time.time() - pipeline_start}
+                guard += 1
+                if guard > 2000:
+                    break
+
+        # 2. Remaining work = jobs still needing a résumé OR a cover letter.
+        pend_t = _count_pending("tailor", min_score) if do["tailor"] else 0
+        pend_c = _count_pending("cover", min_score) if do["cover"] else 0
+        if pend_t == 0 and pend_c == 0:
+            break
+
+        batch_no += 1
+        console.print(f"\n[bold cyan]── Batch {batch_no}: {pend_t} to tailor, {pend_c} to cover "
+                      f"(≤{batch_size}/stage) ──[/bold cyan]")
+
+        produced = 0  # résumés + cover letters actually generated this batch
+        if do["tailor"] and pend_t > 0:
+            ok, r = stage(lambda: run_tailoring(min_score=min_score, limit=batch_size,
+                                                validation_mode=validation_mode,
+                                                provider=tailor_provider), "tailor")
+            if not ok:
+                break
+            produced += r.get("approved", 0)
+        if do["cover"] and pend_c > 0:
+            ok, r = stage(lambda: run_cover_letters(min_score=min_score, limit=batch_size,
+                                                    validation_mode=validation_mode,
+                                                    provider=cover_provider), "cover")
+            if not ok:
+                break
+            produced += r.get("generated", 0)
+        if do["pdf"]:
+            stage(lambda: batch_convert(), "pdf")
+
+        # Stop only if a full batch produced NOTHING (remaining jobs are stuck on
+        # validation/judge failures and will never succeed) and we're not still
+        # scoring up new candidates.
+        if produced == 0 and not (do["score"] and _eligible_unscored() > 0):
+            console.print("  [yellow]No résumés or covers produced this batch — remaining jobs "
+                          "are failing validation/judge. Stopping.[/yellow]")
+            break
+
+    elapsed = time.time() - pipeline_start
+    console.print(f"\n[green]Batched run complete[/green] — {batch_no} batch(es) in {elapsed:.0f}s.")
+    return {"stages": results, "errors": {}, "elapsed": elapsed}
+
+
+def _stop_requested() -> bool:
+    return False
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
@@ -448,6 +685,13 @@ def run_pipeline(
     stream: bool = False,
     workers: int = 1,
     validation_mode: str = "normal",
+    auto_resume: bool = False,
+    resume_wait: int = 120,
+    score_model: str | None = None,
+    score_provider: str | None = None,
+    tailor_provider: str | None = None,
+    cover_provider: str | None = None,
+    batch: int = 0,
 ) -> dict:
     """Run pipeline stages.
 
@@ -495,13 +739,63 @@ def run_pipeline(
         console.print(f"\n  No changes made.")
         return {"stages": [], "errors": {}, "elapsed": 0.0}
 
+    # Smart resume: a full run starts at discover and re-scrapes the boards. If
+    # the DB already holds discovered jobs that still need processing, don't
+    # silently re-scrape — ask whether to continue the existing batch instead.
+    if "discover" in ordered and sys.stdin.isatty():
+        total = pre_stats.get("total", 0)
+        # Count what will ACTUALLY be processed: eligible (not excluded, not
+        # parked-unknown) jobs still needing scoring — not the raw unscored count,
+        # which would misleadingly include region-locked/excluded rows.
+        conn = get_connection()
+        eligible_pending = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE fit_score IS NULL "
+            "AND COALESCE(excluded,0)=0 "
+            "AND (location_status IN ('local','worldwide','relocation','override') OR location_status IS NULL)"
+        ).fetchone()[0]
+        excluded = conn.execute("SELECT COUNT(*) FROM jobs WHERE excluded=1").fetchone()[0]
+        parked = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE COALESCE(excluded,0)=0 AND location_status='unknown'"
+        ).fetchone()[0]
+        if total > 0:
+            console.print(Panel(
+                f"You already have [bold]{total}[/bold] discovered jobs:\n"
+                f"  • [bold cyan]{eligible_pending}[/bold cyan] eligible & still to process "
+                f"(enrich/score/tailor)\n"
+                f"  • [dim]{excluded} excluded (region-locked/blocklisted) — skipped[/dim]\n"
+                f"  • [dim]{parked} unknown-location — parked (use the dashboard 'Enrich' button)[/dim]\n\n"
+                f"  [bold cyan]c[/bold cyan] = process the {eligible_pending} eligible existing jobs "
+                f"(skip re-scraping) [dim]— recommended[/dim]\n"
+                f"  [bold cyan]d[/bold cyan] = discover fresh AND process everything "
+                f"(adds new postings)\n"
+                f"  [bold cyan]q[/bold cyan] = cancel",
+                title="Existing jobs found",
+                border_style="cyan",
+            ))
+            choice = input("> ").strip().lower() if sys.stdin.isatty() else "d"
+            if choice == "q":
+                console.print("Cancelled.")
+                return {"stages": [], "errors": {}, "elapsed": 0.0}
+            if choice == "c":
+                ordered = [s for s in ordered if s != "discover"]
+                console.print(f"[dim]Skipping discovery. Stages: {' -> '.join(ordered)}[/dim]")
+
     # Execute
-    if stream:
+    if batch and batch > 0 and not stream:
+        console.print(f"  [cyan]Batched mode:[/cyan] {batch} job(s) per batch through "
+                      f"{' -> '.join(ordered)}")
+        result = _run_batched(ordered, min_score, batch, validation_mode,
+                              auto_resume, resume_wait, score_model, score_provider,
+                              tailor_provider, cover_provider)
+    elif stream:
         result = _run_streaming(ordered, min_score, workers=workers,
                                 validation_mode=validation_mode)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+                                 validation_mode=validation_mode,
+                                 auto_resume=auto_resume, resume_wait=resume_wait,
+                                 score_model=score_model, score_provider=score_provider,
+                                 tailor_provider=tailor_provider, cover_provider=cover_provider)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

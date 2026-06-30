@@ -65,7 +65,11 @@ def _build_profile_summary(profile: dict) -> str:
 
     # Compensation
     currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    sec_cur, sec_amt = comp.get("salary_secondary_currency", ""), comp.get("salary_secondary_amount", "")
+    salary_line = f"Salary Expectation: ${comp['salary_expectation']}/year {currency}"
+    if sec_cur and sec_amt:
+        salary_line += f" (≈ {sec_amt} {sec_cur}/year)"
+    lines.append(salary_line)
 
     # Experience
     if exp.get("years_of_experience_total"):
@@ -130,6 +134,14 @@ def _build_salary_section(profile: dict) -> str:
     comp = profile["compensation"]
     currency = comp.get("salary_currency", "USD")
     floor = comp["salary_expectation"]
+    sec_cur = comp.get("salary_secondary_currency", "")
+    sec_amt = comp.get("salary_secondary_amount", "")
+    secondary_line = ""
+    if sec_cur and sec_amt:
+        try:
+            secondary_line = f"\nEquivalent: about {int(sec_amt):,} {sec_cur}/year — use this ONLY if a form asks for salary in {sec_cur}."
+        except (ValueError, TypeError):
+            secondary_line = f"\nEquivalent: about {sec_amt} {sec_cur}/year — use this ONLY if a form asks for salary in {sec_cur}."
     range_min = comp.get("salary_range_min", floor)
     range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
     conversion_note = comp.get("currency_conversion_note", "")
@@ -153,7 +165,7 @@ def _build_salary_section(profile: dict) -> str:
         convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
 
     return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
+${floor} {currency}/year is the FLOOR. Never go below it. But don't always use it either.{secondary_line}
 
 Decision tree:
 1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
@@ -358,7 +370,7 @@ def build_prompt(job: dict, tailored_resume: str,
 == JOB ==
 URL: {job.get('application_url') or job['url']}
 Title: {job['title']}
-Company: {job.get('site', 'Unknown')}
+Company: {(job.get('company') or '').strip() or 'unknown — read it off the job page'}
 Fit Score: {job.get('fit_score', 'N/A')}/10
 
 == FILES ==

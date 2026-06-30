@@ -5,6 +5,20 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+# exported job-alert emails (PII)
+*.mbox
+# personal resume
+wn_resume_v8.pdf
+# generated job<->file manifest (contains job/company data)
+applications.csv
+
+# Personal/test artifacts & one-off regeneration scaffolding
+nvidia_test_samples/
+regen.log
+regen_batch_*.json
+regen_all.py
+regen_lib.py
+regen_rules.md
 
 # Runtime artifacts
 *.db
