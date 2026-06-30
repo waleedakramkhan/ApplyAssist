@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 
 from applyassist.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
 from applyassist.database import get_connection, get_jobs_by_stage
-from applyassist.llm import get_client
+from applyassist.llm import get_client, LLMHaltError
 from applyassist.scoring.validator import (
     BANNED_WORDS,
     LLM_LEAK_PHRASES,
+    extract_resume_metrics,
+    fabricated_numbers,
     sanitize_text,
     validate_cover_letter,
 )
@@ -28,7 +30,7 @@ MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 # ── Prompt Builder (profile-driven) ──────────────────────────────────────
 
-def _build_cover_letter_prompt(profile: dict) -> str:
+def _build_cover_letter_prompt(profile: dict, resume_text: str = "") -> str:
     """Build the cover letter system prompt from the user's profile.
 
     All personal data, skills, and sign-off name come from the profile.
@@ -47,9 +49,12 @@ def _build_cover_letter_prompt(profile: dict) -> str:
             all_skills.extend(items)
     skills_str = ", ".join(all_skills) if all_skills else "the tools listed in the resume"
 
-    # Real metrics from resume_facts
+    # Real metrics: prefer numbers actually present in the resume over the
+    # profile's (often placeholder) real_metrics list.
     real_metrics = resume_facts.get("real_metrics", [])
     preserved_projects = resume_facts.get("preserved_projects", [])
+    extracted = extract_resume_metrics(resume_text)
+    allowed_metrics = extracted or [m for m in real_metrics if any(c.isdigit() for c in m)]
 
     # Build achievement examples for the prompt
     projects_hint = ""
@@ -57,47 +62,68 @@ def _build_cover_letter_prompt(profile: dict) -> str:
         projects_hint = f"\nKnown projects to reference: {', '.join(preserved_projects)}"
 
     metrics_hint = ""
-    if real_metrics:
-        metrics_hint = f"\nReal metrics to use: {', '.join(real_metrics)}"
+    if allowed_metrics:
+        metrics_hint = (
+            f"\nThe ONLY numbers you may use (exactly as written, from the resume): "
+            f"{', '.join(allowed_metrics)}. Never invent, inflate, or reword a number; "
+            f"a claim without a real number stays qualitative."
+        )
 
     # Build the full banned list from the validator so the prompt stays in sync
     # with what will actually be rejected — the validator checks all of these.
     all_banned = ", ".join(f'"{w}"' for w in BANNED_WORDS)
     leak_banned = ", ".join(f'"{p}"' for p in LLM_LEAK_PHRASES)
 
-    return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
+    return f"""You are an expert cover letter writer and job application strategist writing for {sign_off_name}. The single goal is to make a recruiter want to interview {sign_off_name}.
 
-STRUCTURE: 3 short paragraphs. Under 250 words. Every sentence must earn its place.
+## PROCESS (do this silently, then write):
+1. Read the job description and pull out the 3-5 most important qualifications, themes, or problems the team is actually trying to solve.
+2. From the resume, pick the 1-2 experiences that most directly match those priorities. Ignore the rest.
+3. Write the letter around that overlap. Depth on the strongest evidence beats breadth.
 
-PARAGRAPH 1 (2-3 sentences): Open with a specific thing YOU built that solves THEIR problem. Not "I'm excited about this role." Not "This role aligns with my experience." Start with the work.
+## STRUCTURE (3 short paragraphs, ~250-350 words):
+1. HOOK — Open with something specific about THIS company or role: its product, scale, growth stage, mission, or the hard technical problem it's solving, tied to why {sign_off_name}'s background fits it. Make the role feel concrete and real from the first sentence.
+2. EVIDENCE — The strongest 1-2 matching experiences from the resume, with concrete detail and real numbers. Frame each as solving the team's problem, not as a list of accomplishments.
+3. CLOSE — Why this exact background fits this exact role, then a warm, confident line inviting a conversation.
 
-PARAGRAPH 2 (3-4 sentences): Pick 2 achievements from the resume that are MOST relevant to THIS job. Use numbers. Frame as solving their problem, not listing your accomplishments.{projects_hint}{metrics_hint}
+## OPENING — WHAT NOT TO DO (these read as templates and kill the letter):
+- Do NOT start with "I am writing to apply for..." or "I'm excited about..." or "I'm interested in...".
+- Do NOT open by summarizing the job description back to them.
+- Do NOT start the first paragraph, or any sentence, with "What" (no "What stands out about...", "What excites me about...").
+- Do NOT start with "As a...".
+- The opening must sound like a sharp, specific person with judgment wrote it, not a generator.
 
-PARAGRAPH 3 (1-2 sentences): One specific thing about the company from the job description (a product, a technical challenge, a team structure). Then close. "Happy to walk through any of this in more detail." or "Let's discuss." Nothing else.
+## VOICE:
+- Natural, human, personally written. Direct, not stiff, not overly formal, not casual.
+- Persuasive without exaggeration. Confident without hype.
+- Vary sentence length and structure so it reads like a person.
+- Never narrate yourself (BAD: "This demonstrates my commitment to X." just state the fact).
+- Never hedge (BAD: "might help with some of your challenges." GOOD: "solves the same problem your team is facing.").
+- No bullet points, no headings, no subject line. Prose only.
 
-BANNED WORDS AND PHRASES (automated validator rejects ANY of these — do not use even once):
+## NUMBERS:
+- Use numbers, not words, for impact ("cut deployment time by 50%", not "in half") so achievements are visible at a glance.{metrics_hint}
+
+## HARD RULES — fabrication is rejected:
+- Use ONLY information supported by the resume and the job description. Invent nothing: no experience, no metrics, no qualifications, no tools.
+- The candidate's real tools are ONLY: {skills_str}. Do not name any tool outside this list. If the job wants a tool not listed, write about the work, not the tool.
+- Do not repeat the resume verbatim; reframe it for this role.{projects_hint}
+
+## BANNED WORDS / PHRASES (an automated validator rejects ANY of these, do not use even once):
 {all_banned}
 
-ALSO BANNED (meta-commentary the validator catches):
+## ALSO BANNED (meta-commentary the validator catches):
 {leak_banned}
 
-BANNED PUNCTUATION: No em dashes (—) or en dashes (–). Use commas or periods.
+## PUNCTUATION: No em dashes or en dashes. Use commas or periods.
 
-VOICE:
-- Write like a real engineer emailing someone they respect. Not formal, not casual. Just direct.
-- NEVER narrate or explain what you're doing. BAD: "This demonstrates my commitment to X." GOOD: Just state the fact and move on.
-- NEVER hedge. BAD: "might address some of your challenges." GOOD: "solves the same problem your team is facing."
-- Every sentence should contain either a number, a tool name, or a specific outcome. If it doesn't, cut it.
-- Read it out loud. If it sounds like a robot wrote it, rewrite it.
+## SALUTATION: If a specific recruiter or hiring manager name appears in the job description, address them by name ("Dear [Name],"). Otherwise start with exactly "Dear Hiring Manager,".
 
-FABRICATION = INSTANT REJECTION:
-The candidate's real tools are ONLY: {skills_str}.
-Do NOT mention ANY tool not in this list. If the job asks for tools not listed, talk about the work you did, not the tools.
+## SELF-CHECK before output (silently): opening is specific and not formulaic; sounds human; no em dashes; no unsupported claims or invented numbers; clearly tailored to this role; uses real numbers; a recruiter would be more likely to interview after reading it.
 
-Sign off: just "{sign_off_name}"
+Sign off with just "{sign_off_name}" on the last line.
 
-Output ONLY the letter text. No subject lines. No "Here is the cover letter:" preamble. No notes after the sign-off.
-Start DIRECTLY with "Dear Hiring Manager," and end with the name."""
+Output ONLY the final letter. No preamble, no "Here is the cover letter:", no notes, no analysis. Start directly with the salutation."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -119,7 +145,7 @@ def _strip_preamble(text: str) -> str:
 
 def generate_cover_letter(
     resume_text: str, job: dict, profile: dict,
-    max_retries: int = 3, validation_mode: str = "normal",
+    max_retries: int = 3, validation_mode: str = "normal", client=None,
 ) -> str:
     """Generate a cover letter with fresh context on each retry + auto-sanitize.
 
@@ -136,17 +162,24 @@ def generate_cover_letter(
     Returns:
         The cover letter text (best attempt even if validation failed).
     """
+    # Use the REAL employer (company), never the job board (site='LinkedIn').
+    company = (job.get("company") or "").strip()
+    company_line = (
+        f"COMPANY: {company}\n" if company
+        else "COMPANY: (not provided — do NOT name a company; write naturally, "
+             "open on the role/work, not on the employer's name)\n"
+    )
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"{company_line}"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
 
     avoid_notes: list[str] = []
     letter = ""
-    client = get_client()
-    cl_prompt_base = _build_cover_letter_prompt(profile)
+    client = client or get_client()
+    cl_prompt_base = _build_cover_letter_prompt(profile, resume_text=resume_text)
 
     for attempt in range(max_retries + 1):
         # Fresh conversation every attempt
@@ -170,23 +203,39 @@ def generate_cover_letter(
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 
         validation = validate_cover_letter(letter, mode=validation_mode)
-        if validation["passed"]:
+        problems = list(validation["errors"])
+
+        # Cover-letter quality hinges on killing templated/weak phrasing, so
+        # promote banned-word warnings to retry triggers (in normal mode they'd
+        # otherwise be silently accepted). The model gets up to max_retries
+        # attempts to rewrite without them; the last attempt is kept regardless.
+        for w in validation.get("warnings", []):
+            if w.lower().startswith("banned"):
+                problems.append(f"Rewrite without these templated/weak phrases: {w}")
+
+        # Fabricated numbers are a hard error regardless of mode — a fake metric
+        # in a cover letter is as damaging as one in the resume.
+        fake_nums = fabricated_numbers(letter.lower(), resume_text.lower())
+        if fake_nums:
+            problems.append(f"Fabricated number(s) not in resume: {', '.join(fake_nums[:5])}")
+
+        if not problems:
             return letter
 
-        avoid_notes.extend(validation["errors"])
-        # Warnings never block — only hard errors trigger a retry
+        avoid_notes.extend(problems)
         log.debug(
-            "Cover letter attempt %d/%d failed: %s",
-            attempt + 1, max_retries + 1, validation["errors"],
+            "Cover letter attempt %d/%d needs rework: %s",
+            attempt + 1, max_retries + 1, problems,
         )
 
-    return letter  # last attempt even if failed
+    return letter  # last attempt even if it still has issues
 
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_cover_letters(min_score: int = 7, limit: int = 20,
-                      validation_mode: str = "normal") -> dict:
+                      validation_mode: str = "normal",
+                      provider: str | None = None) -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
     Args:
@@ -200,6 +249,14 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
+
+    # Optional per-stage provider override (e.g. cover letters on NVIDIA/Mistral
+    # while the rest of the pipeline runs on the default provider).
+    cover_client = None
+    if provider:
+        from applyassist.llm import build_client_for_provider
+        cover_client = build_client_for_provider(provider)
+        log.info("Cover letters on provider override: %s", provider)
 
     # Fetch jobs that have tailored resumes but no cover letter yet
     jobs = conn.execute(
@@ -235,12 +292,12 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
         completed += 1
         try:
             letter = generate_cover_letter(resume_text, job, profile,
-                                          validation_mode=validation_mode)
+                                          validation_mode=validation_mode,
+                                          client=cover_client)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            # Unique per-job prefix (job id) so same-title jobs never collide.
+            from applyassist.config import asset_prefix
+            prefix = asset_prefix(job)
 
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")
@@ -268,6 +325,9 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
                 "%d/%d [OK] | %.1f jobs/min | %s",
                 completed, len(jobs), rate * 60, result["title"][:40],
             )
+        except LLMHaltError:
+            # Rate-limit/quota halt — stop cleanly so the batch checkpoints.
+            raise
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
@@ -277,24 +337,23 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             results.append(result)
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
-    # Persist to DB: increment attempt counter for ALL, save path only for successes
-    now = datetime.now(timezone.utc).isoformat()
-    saved = 0
-    for r in results:
-        if r.get("path"):
+        # Checkpoint THIS job immediately so the dashboard updates live and an
+        # interrupt never re-generates a finished cover letter.
+        now = datetime.now(timezone.utc).isoformat()
+        if result.get("path"):
             conn.execute(
                 "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
                 "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
+                (result["path"], now, result["url"]),
             )
-            saved += 1
         else:
             conn.execute(
                 "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["url"],),
+                (result["url"],),
             )
-    conn.commit()
+        conn.commit()
 
+    saved = sum(1 for r in results if r.get("path"))
     elapsed = time.time() - t0
     log.info("Cover letters done in %.1fs: %d generated, %d errors", elapsed, saved, error_count)
 

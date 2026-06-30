@@ -38,6 +38,16 @@ BANNED_WORDS: list[str] = [
     # Cover-letter-specific additions
     "this demonstrates", "this reflects", "i have experience with",
     "furthermore", "additionally", "moreover",
+    # Weak/generic openers, hedges, and clichéd closes (contraction forms too,
+    # since word-boundary matching treats "i'm excited" and "i am excited"
+    # separately). These are the phrases that make a cover letter read as a template.
+    "i'm excited", "i'm confident", "i'm passionate", "i'm thrilled",
+    "i am thrilled", "i'm drawn to", "i am drawn to", "drawn to the",
+    "resonates", "resonate", "resonated", "deeply resonates",
+    "i look forward to discussing", "look forward to discussing",
+    "significant impact", "make a significant impact", "perfect fit",
+    "i would love to", "i'd love to", "excited about the opportunity",
+    "thrilled at the opportunity",
 ]
 
 LLM_LEAK_PHRASES: list[str] = [
@@ -85,6 +95,65 @@ def _build_skills_set(profile: dict) -> set[str]:
     return allowed
 
 
+# A numeric claim = a percentage, an "Nx" multiplier, or an "N+" count. These
+# are the impact figures recruiters read; inventing one is the most common
+# fabrication. (Plain integers like "5 engineers" are deliberately NOT flagged
+# here — too many false positives from rewording; the LLM judge covers those.)
+_NUM_CLAIM_RE = re.compile(r"\d+(?:\.\d+)?\s*%\+?|\b\d+(?:\.\d+)?\s*x\b|\b\d+\+")
+_NUM_CORE_RE = re.compile(r"\d+(?:\.\d+)?")
+
+# Impact metrics: percentages, "Nx" multipliers, "N+" counts, and "<number>
+# <noun>" scope. Used to build the exact whitelist of figures a tailored resume
+# or cover letter may contain.
+_METRIC_RE = re.compile(
+    r"\d+(?:\.\d+)?%\+?"
+    r"|\b\d+(?:\.\d+)?\s*x\b"
+    r"|\b\d+\+"
+    r"|\b\d+\s+(?:engineers?|developers?|users?|services?|hours?|days?|weeks?|"
+    r"months?|nodes?|customers?|people|teams?|third-party|countries|regions?)\b",
+    re.I,
+)
+
+
+def extract_resume_metrics(resume_text: str) -> list[str]:
+    """Return the ordered, de-duplicated real impact numbers in a resume.
+
+    The ONLY figures a tailored resume/cover letter may contain. Contact/date
+    lines are skipped (only content lines are scanned) so years don't pollute it.
+    """
+    metrics: list[str] = []
+    for raw in (resume_text or "").splitlines():
+        line = raw.strip()
+        if not line or line.isupper():
+            continue
+        for m in _METRIC_RE.findall(line):
+            t = " ".join(m.split())
+            if t and t not in metrics:
+                metrics.append(t)
+    return metrics
+
+
+def fabricated_numbers(tailored_text: str, original_text: str) -> list[str]:
+    """Return numeric claims (%, Nx, N+) in the tailored text whose value never
+    appears anywhere in the original resume — i.e. invented figures.
+
+    Compares the bare number (ignoring %/+/x/spacing) against every number in the
+    original, so reformatting ("30%+" -> "30%") doesn't trip it but a brand-new
+    "45%" on a bullet that never had one does.
+    """
+    if not original_text:
+        return []
+    allowed = set(_NUM_CORE_RE.findall(original_text))
+    bad: list[str] = []
+    for claim in _NUM_CLAIM_RE.findall(tailored_text):
+        core = _NUM_CORE_RE.search(claim)
+        if core and core.group() not in allowed:
+            c = " ".join(claim.split())
+            if c not in bad:
+                bad.append(c)
+    return bad
+
+
 def sanitize_text(text: str) -> str:
     """Auto-fix common LLM output issues instead of rejecting."""
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")   # em dash -> comma
@@ -96,7 +165,8 @@ def sanitize_text(text: str) -> str:
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
+def validate_json_fields(data: dict, profile: dict, mode: str = "normal",
+                         original_resume: str = "") -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
@@ -106,6 +176,10 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
                  strict  → banned words are errors (trigger retries)
                  normal  → banned words are warnings (no retry)
                  lenient → banned words ignored entirely
+        original_resume: The candidate's original resume text. A watchlisted
+                 skill is only "fabricated" if it appears in NEITHER the declared
+                 skills_boundary NOR the original resume — this prevents flagging
+                 skills the candidate genuinely has (e.g. "Go (Golang)" -> golang).
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -113,23 +187,31 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    # Required keys — always checked regardless of mode. "projects" may be an
+    # empty list (a resume legitimately has none), so it only needs to be present.
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
+    if "projects" not in data:
+        errors.append("Missing required field: projects")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
     # Collect all text for bulk checks
     all_text_parts: list[str] = [data["summary"]]
 
-    # Skills: check for fabrication (always enforced)
+    # Skills: check for fabrication (always enforced).
+    # A watchlisted skill only counts as fabricated if the candidate doesn't
+    # actually have it — i.e. it's absent from BOTH their declared skills and
+    # their original resume. Otherwise legitimate skills like "Go (Golang)" or a
+    # Django project on the real resume would be falsely rejected.
+    legit_text = " ".join(_build_skills_set(profile)) + " " + (original_resume or "").lower()
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
-            if fake in skills_text:
+            if fake in skills_text and fake not in legit_text:
                 errors.append(f"Fabricated skill: '{fake}'")
 
     # Experience: preserved companies must be present (always enforced)
@@ -163,6 +245,16 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
+
+    # Fabricated numbers: any %, Nx, or N+ claim in the summary/bullets whose
+    # value isn't in the original resume is invented — always a hard error (it
+    # triggers a retry) since a fake metric is the costliest kind of lie.
+    if original_resume:
+        fake_nums = fabricated_numbers(all_text, original_resume.lower())
+        if fake_nums:
+            errors.append(
+                f"Fabricated number(s) not in original resume: {', '.join(fake_nums[:5])}"
+            )
 
     # LLM self-talk is always an error regardless of mode (indicates broken output)
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
@@ -324,12 +416,12 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
             else:  # normal
                 warnings.append(msg)
 
-    # 3. Word count
+    # 3. Word count — target ~250-350 words.
     words = len(text.split())
-    if mode == "strict" and words > 250:
-        errors.append(f"Too long ({words} words). Max 250.")
-    elif mode == "normal" and words > 275:
-        warnings.append(f"Long ({words} words). Target 250.")
+    if mode == "strict" and words > 380:
+        errors.append(f"Too long ({words} words). Max ~350.")
+    elif mode == "normal" and words > 410:
+        warnings.append(f"Long ({words} words). Target 250-350.")
     # lenient: no word count check
 
     # 4. LLM self-talk — always an error regardless of mode

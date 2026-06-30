@@ -92,6 +92,35 @@ def init() -> None:
 
 
 @app.command()
+def manifest() -> None:
+    """Write a CSV mapping every tailored job to its résumé + cover-letter files."""
+    _bootstrap()
+    import csv
+    from pathlib import Path
+    from applyassist.config import APP_DIR
+    from applyassist.database import get_connection
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT fit_score, company, title, location, url, tailored_resume_path, "
+        "cover_letter_path, applied_at FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        "ORDER BY applied_at IS NOT NULL, fit_score DESC, company"
+    ).fetchall()
+    out = APP_DIR / "applications.csv"
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["score", "company", "title", "location", "applied",
+                    "job_url", "resume_pdf", "cover_pdf"])
+        for sc, co, ti, loc, url, rp, cp, ap in rows:
+            rpdf = str(Path(rp).with_suffix(".pdf")) if rp else ""
+            cpdf = str(Path(cp).with_suffix(".pdf")) if cp else ""
+            w.writerow([sc, co or "(see posting)", ti, loc or "",
+                        "YES" if ap else "", url, rpdf, cpdf])
+    console.print(f"[green]Wrote {len(rows)} rows[/green] -> {out}")
+    console.print(f"[dim]Open it:[/dim] open {out}")
+
+
+@app.command()
 def run(
     stages: Optional[list[str]] = typer.Argument(
         None,
@@ -105,6 +134,14 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    batch: int = typer.Option(0, "--batch", help="Process in batches of N: score until N eligible jobs are ready, push that batch through tailor→cover→pdf, then repeat. Gets ready-to-apply jobs out fast (e.g. --batch 5)."),
+    auto_resume: bool = typer.Option(False, "--auto-resume", help="On a rate-limit halt, sleep and automatically resume the stage instead of stopping. Lets a big batch run unattended on free-tier APIs."),
+    resume_wait: int = typer.Option(120, "--resume-wait", help="Seconds to sleep before each auto-resume (only with --auto-resume)."),
+    provider: Optional[str] = typer.Option(None, "--provider", help="Default provider for ALL LLM stages this run (reads LLM_URL_<NAME>/LLM_API_KEY_<NAME>/LLM_MODEL_<NAME> from .env). Pass a COMMA-SEPARATED chain (e.g. --provider cerebras,gemini,groq) to auto-rotate to the next free provider when one hits its daily limit."),
+    score_model: Optional[str] = typer.Option(None, "--score-model", help="Use a different model for the SCORE stage only (e.g. 'gemini-2.0-flash'), inferring provider from the model name. Tailor/cover keep the default writing model."),
+    score_provider: Optional[str] = typer.Option(None, "--score-provider", help="Run the SCORE stage on a separate named provider (e.g. --score-provider cerebras) while tailor/cover use the default --provider. Wins over --score-model."),
+    tailor_provider: Optional[str] = typer.Option(None, "--tailor-provider", help="Run the TAILOR (résumé) stage on a separate named provider (e.g. --tailor-provider cerebras) while the rest use the default --provider."),
+    cover_provider: Optional[str] = typer.Option(None, "--cover-provider", help="Run the COVER LETTER stage on a separate named provider (e.g. --cover-provider mistral) while the rest use the default --provider."),
     validation: str = typer.Option(
         "normal",
         "--validation",
@@ -118,6 +155,10 @@ def run(
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
+
+    if provider:
+        from applyassist.llm import set_default_provider
+        set_default_provider(provider)
 
     from applyassist.pipeline import run_pipeline
 
@@ -154,10 +195,124 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        auto_resume=auto_resume,
+        resume_wait=resume_wait,
+        score_model=score_model,
+        score_provider=score_provider,
+        tailor_provider=tailor_provider,
+        cover_provider=cover_provider,
+        batch=batch,
     )
 
     if result.get("errors"):
         raise typer.Exit(code=1)
+
+
+@app.command(name="import-alerts")
+def import_alerts(
+    from_gmail: bool = typer.Option(False, "--from-gmail", help="Pull alert emails directly from Gmail over IMAP (needs GMAIL_ADDRESS + GMAIL_APP_PASSWORD). No manual export."),
+    gmail_days: Optional[int] = typer.Option(None, "--gmail-days", help="With --from-gmail, only look at alerts newer than N days."),
+    gmail_query: Optional[str] = typer.Option(None, "--gmail-query", help="With --from-gmail, override the Gmail search query (X-GM-RAW syntax)."),
+    from_files: Optional[str] = typer.Option(None, "--from-files", help="A single exported file (.eml/.mbox/.html) OR a folder of them. Defaults to ~/.applyassist/inbox."),
+    include_region_locked: bool = typer.Option(False, "--include-region-locked", help="Bypass the region-lock filter: keep region-locked roles (status 'override') and score/tailor them too."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max new jobs to import."),
+    run: bool = typer.Option(True, "--run/--no-run", help="Auto-continue into score → tailor → cover → pdf for eligible jobs (default on)."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailoring."),
+) -> None:
+    """Import jobs from LinkedIn job-alert emails (bypasses discovery).
+
+    Two ways to get the emails in:
+      --from-gmail   Connect to Gmail over IMAP and pull every matching alert
+                     automatically (recommended for 100s of emails). Set
+                     GMAIL_ADDRESS and GMAIL_APP_PASSWORD in ~/.applyassist/.env.
+      (default)      Read exported .eml/.mbox/.html from ~/.applyassist/inbox.
+
+    Either way it extracts the job links, pulls each posting from LinkedIn's
+    guest API (title/company/location/description, no login), inserts them
+    already-enriched, excludes region-locked ones, and — by default — scores and
+    tailors the eligible jobs.
+    """
+    _bootstrap()
+
+    from applyassist.config import ALERTS_INBOX
+    from applyassist.discovery.linkedin_alerts import import_alerts as do_import
+
+    folder = from_files or str(ALERTS_INBOX)
+    if include_region_locked:
+        console.print("[yellow]--include-region-locked:[/yellow] region-locked roles will be kept and processed.")
+    try:
+        if from_gmail:
+            console.print("[bold blue]Importing LinkedIn alerts[/bold blue] from Gmail (IMAP)")
+            stats = do_import(gmail=True, gmail_query=gmail_query, gmail_days=gmail_days,
+                              run=run, limit=limit, min_score=min_score,
+                              bypass_region_lock=include_region_locked)
+        else:
+            console.print(f"[bold blue]Importing LinkedIn alerts[/bold blue] from {folder}")
+            stats = do_import(folder=folder, run=run, limit=limit, min_score=min_score,
+                              bypass_region_lock=include_region_locked)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    console.print(
+        f"\n[green]Done.[/green] Found {stats['found']} job link(s): "
+        f"{stats['new']} new imported, {stats['already']} already in DB, "
+        f"{stats['failed']} could not be fetched."
+    )
+    cls = stats.get("classified", {})
+    if cls:
+        from applyassist.filters import ELIGIBLE_STATUSES
+        eligible = sum(cls.get(s, 0) for s in ELIGIBLE_STATUSES)
+        console.print(
+            f"[dim]Classified: {eligible} eligible, "
+            f"{cls.get('region_locked', 0)} region-locked (excluded), "
+            f"{cls.get('unknown', 0)} unknown.[/dim]"
+        )
+    if stats["found"] == 0:
+        if from_gmail:
+            console.print(
+                "[yellow]No LinkedIn job links found in Gmail.[/yellow] Check that "
+                "GMAIL_ADDRESS is right, you actually have alert emails, and try a "
+                "wider window (e.g. drop --gmail-days or raise it)."
+            )
+        else:
+            console.print(
+                f"[yellow]No LinkedIn job links found.[/yellow] Export your alert emails "
+                f"(.eml or .mbox) into [bold]{folder}[/bold] and try again, or use "
+                f"[bold]--from-gmail[/bold] to pull them automatically."
+            )
+
+
+@app.command(name="include-region-locked")
+def include_region_locked(
+    today: bool = typer.Option(False, "--today", help="Only un-exclude jobs discovered today."),
+    strategy: Optional[str] = typer.Option(None, "--strategy", help="Restrict to one discovery strategy, e.g. linkedin_alert."),
+    run: bool = typer.Option(False, "--run", help="After un-excluding, run score → tailor → cover → pdf on them."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailoring when --run is set."),
+) -> None:
+    """Un-exclude region-locked jobs already in the DB so they get processed.
+
+    Flips region-locked rows to the eligible 'override' status (excluded=0).
+    Only location exclusions are touched — manual/blocklist exclusions stay.
+    """
+    _bootstrap()
+    from applyassist.database import bypass_region_locked
+
+    n = bypass_region_locked(today_only=today, strategy=strategy)
+    scope = []
+    if today:
+        scope.append("discovered today")
+    if strategy:
+        scope.append(f"strategy={strategy}")
+    scope_str = (" (" + ", ".join(scope) + ")") if scope else ""
+    console.print(f"[green]Un-excluded {n} region-locked job(s){scope_str}.[/green] "
+                  f"They're now eligible (status 'override').")
+
+    if run and n:
+        from applyassist.pipeline import run_pipeline
+        run_pipeline(stages=["score", "tailor", "cover", "pdf"], min_score=min_score)
+    elif n:
+        console.print("[dim]Run them with:[/dim] ./applyassist.sh run score tailor cover pdf")
 
 
 @app.command()
@@ -370,13 +525,25 @@ def status() -> None:
 
 
 @app.command()
-def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+def dashboard(
+    static: bool = typer.Option(False, "--static", help="Write a static HTML file instead of serving the interactive dashboard."),
+    port: Optional[int] = typer.Option(None, "--port", help="Port for the interactive dashboard server."),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't auto-open the browser."),
+) -> None:
+    """Open the interactive dashboard: filter roles and exclude ones you don't want.
+
+    Exclusions persist — excluded jobs and keyword-blocklisted ones are skipped by
+    scoring, tailoring, and apply. Use --static for a plain read-only HTML file.
+    """
     _bootstrap()
 
-    from applyassist.view import open_dashboard
+    if static:
+        from applyassist.view import open_dashboard
+        open_dashboard()
+        return
 
-    open_dashboard()
+    from applyassist.dashboard_server import serve
+    serve(port=port, open_browser=not no_open)
 
 
 @app.command()

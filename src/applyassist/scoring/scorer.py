@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from applyassist.config import RESUME_PATH, load_profile
 from applyassist.database import get_connection, get_jobs_by_stage
-from applyassist.llm import get_client
+from applyassist.llm import get_client, LLMHaltError
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ def _parse_score_response(response: str) -> dict:
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
-def score_job(resume_text: str, job: dict) -> dict:
+def score_job(resume_text: str, job: dict, client=None) -> dict:
     """Score a single job against the resume.
 
     Args:
@@ -93,15 +93,48 @@ def score_job(resume_text: str, job: dict) -> dict:
     ]
 
     try:
-        client = get_client()
+        client = client or get_client()
         response = client.chat(messages, max_tokens=512, temperature=0.2)
         return _parse_score_response(response)
+    except LLMHaltError:
+        # Quota exhausted / provider unreachable — do NOT record a score.
+        # Propagate so the batch halts and checkpoints; this job stays unscored
+        # and is retried on the next run.
+        raise
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
-def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
+def score_one(url: str) -> dict:
+    """Score a single job by URL, on demand (the dashboard 'Enrich' button).
+
+    Bypasses the location-eligibility gate — the user explicitly chose to process
+    this parked job. Writes the score to the DB. Returns a small result dict.
+    """
+    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "job not found"}
+    job = dict(zip(row.keys(), row))
+    if not (job.get("full_description") or "").strip():
+        return {"ok": False, "error": "no description available to score yet"}
+    try:
+        result = score_job(resume_text, job)
+    except LLMHaltError as e:
+        return {"ok": False, "error": f"LLM unavailable ({e})"}
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+        (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, url),
+    )
+    conn.commit()
+    return {"ok": True, "score": result["score"], "reasoning": result["reasoning"]}
+
+
+def run_scoring(limit: int = 0, rescore: bool = False, model: str | None = None,
+                provider: str | None = None) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
@@ -114,8 +147,24 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
+    # Apply the keyword blocklist first so we never spend quota scoring jobs the
+    # user has chosen to exclude (e.g. "sales", "manager", a company).
+    from applyassist.config import load_exclusions
+    from applyassist.database import apply_blocklist
+    from applyassist.filters import classify_jobs
+    bl = load_exclusions()
+    n_blocked = apply_blocklist(bl["title_contains"], bl["company_contains"], conn=conn)
+    if n_blocked:
+        log.info("Blocklist excluded %d job(s) before scoring.", n_blocked)
+    # Classify any not-yet-classified jobs (sets location_status; excludes
+    # region-locked). Ensures resume-scoring (`run score` without discover) still
+    # gates correctly so only eligible jobs are scored.
+    counts = classify_jobs(conn=conn)
+    if counts:
+        log.info("Location classification: %s", counts)
+
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL AND COALESCE(excluded,0) = 0"
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
@@ -131,38 +180,54 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
 
-    log.info("Scoring %d jobs sequentially...", len(jobs))
+    total = len(jobs)
+    # Optional per-stage override: score on a different provider/model than the
+    # default writing model (e.g. bulk scoring on Cerebras, tailor/cover on the
+    # default). provider wins over model if both are given.
+    from applyassist.llm import build_client_for_model, build_client_for_provider
+    score_client = None
+    if provider:
+        score_client = build_client_for_provider(provider)
+        log.info("Scoring on provider override: %s", provider)
+    elif model:
+        score_client = build_client_for_model(model)
+        log.info("Scoring with override model: %s", model)
+    log.info("Scoring %d jobs sequentially...", total)
     t0 = time.time()
     completed = 0
     errors = 0
-    results: list[dict] = []
+    halted: str | None = None
+    resume_hint = ""
 
     for job in jobs:
-        result = score_job(resume_text, job)
-        result["url"] = job["url"]
-        completed += 1
+        try:
+            result = score_job(resume_text, job, client=score_client)
+        except LLMHaltError as e:
+            # Quota/connection exhausted. Stop here — everything scored so far is
+            # already committed below, and unscored jobs stay pending for resume.
+            halted = "rate_limit" if e.__class__.__name__ == "LLMRateLimitError" else "connection"
+            resume_hint = e.resume_hint
+            log.warning("Scoring halted after %d/%d jobs: %s", completed, total, e)
+            break
 
+        # Checkpoint immediately so progress survives an interruption.
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, job["url"]),
+        )
+        conn.commit()
+        completed += 1
         if result["score"] == 0:
             errors += 1
 
-        results.append(result)
-
         log.info(
             "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
+            completed, total, result["score"], job.get("title", "?")[:60],
         )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs", completed, elapsed)
 
     # Score distribution
     dist = conn.execute("""
@@ -172,9 +237,20 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """).fetchall()
     distribution = [(row[0], row[1]) for row in dist]
 
-    return {
-        "scored": len(results),
+    remaining = total - completed
+    result = {
+        "scored": completed,
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,
+        "remaining": remaining,
     }
+    if halted:
+        result["status"] = f"halted: {halted}"
+        result["halted"] = halted
+        result["resume_hint"] = resume_hint
+        result["message"] = (
+            f"Scored {completed}/{total} before the LLM provider cut us off "
+            f"({halted}). {remaining} job(s) left, progress saved — {resume_hint}."
+        )
+    return result

@@ -1,9 +1,29 @@
 """ApplyAssist configuration: paths, platform detection, user data."""
 
+import hashlib
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
+
+
+def asset_prefix(job: dict) -> str:
+    """Unique, filesystem-safe filename prefix for a job's resume/cover.
+
+    Format: <site>_<title>_<jobid>. The job id (or URL hash) is REQUIRED —
+    without it, the many LinkedIn jobs that share a title (e.g. "Senior Backend
+    Engineer (m/f/d)") collide onto one file and overwrite each other.
+    """
+    def _safe(s: str, n: int) -> str:
+        return re.sub(r"[^\w-]+", "_", (s or "")).strip("_")[:n]
+
+    site = _safe(job.get("site") or "job", 15)
+    title = _safe(job.get("title") or "role", 40)
+    url = job.get("url") or ""
+    m = re.search(r"/jobs/view/(\d{5,})", url) or re.search(r"(\d{6,})", url)
+    uid = m.group(1) if m else hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    return f"{site}_{title}_{uid}"
 
 # User data directory — all user-specific files live here
 APP_DIR = Path(os.environ.get("APPLYASSIST_DIR", Path.home() / ".applyassist"))
@@ -14,7 +34,11 @@ PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
+EXCLUSIONS_PATH = APP_DIR / "exclusions.yaml"
 ENV_PATH = APP_DIR / ".env"
+
+# Inbox for exported LinkedIn alert emails (.eml/.mbox/.html) to import
+ALERTS_INBOX = APP_DIR / "inbox"
 
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"
@@ -87,7 +111,8 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR,
+              APPLY_WORKER_DIR, ALERTS_INBOX]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -111,6 +136,39 @@ def load_search_config() -> dict:
             return yaml.safe_load(example.read_text(encoding="utf-8"))
         return {}
     return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def load_exclusions() -> dict:
+    """Load the keyword blocklist from ~/.applyassist/exclusions.yaml.
+
+    Returns a dict: {"title_contains": [...], "company_contains": [...]}.
+    Discovery/scoring exclude jobs whose title/company contains any of these
+    (case-insensitive substring). Always returns the keys (empty lists if none).
+    """
+    import yaml
+    data: dict = {}
+    if EXCLUSIONS_PATH.exists():
+        data = yaml.safe_load(EXCLUSIONS_PATH.read_text(encoding="utf-8")) or {}
+    return {
+        "title_contains": list(data.get("title_contains", []) or []),
+        "company_contains": list(data.get("company_contains", []) or []),
+    }
+
+
+def save_exclusions(exclusions: dict) -> None:
+    """Persist the keyword blocklist to ~/.applyassist/exclusions.yaml."""
+    import yaml
+    EXCLUSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    clean = {
+        "title_contains": sorted({t.strip() for t in exclusions.get("title_contains", []) if t.strip()}),
+        "company_contains": sorted({c.strip() for c in exclusions.get("company_contains", []) if c.strip()}),
+    }
+    EXCLUSIONS_PATH.write_text(
+        "# ApplyAssist keyword blocklist. Jobs whose title/company contains any of\n"
+        "# these (case-insensitive) are auto-excluded from scoring/tailoring/apply.\n"
+        + yaml.safe_dump(clean, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def load_sites_config() -> dict:

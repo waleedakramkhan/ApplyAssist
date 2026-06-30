@@ -96,6 +96,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             description           TEXT,
             location              TEXT,
             site                  TEXT,
+            company               TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
 
@@ -151,6 +152,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "description": "TEXT",
     "location": "TEXT",
     "site": "TEXT",
+    "company": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
     # Enrichment
@@ -180,6 +182,14 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Exclusion — set from the dashboard (per-job) or by keyword blocklist.
+    # Excluded jobs are skipped by scoring, tailoring, and apply.
+    "excluded": "INTEGER DEFAULT 0",
+    "excluded_reason": "TEXT",
+    # Location eligibility, classified at discovery time from location/url/title/
+    # description: local | worldwide | relocation | region_locked | unknown.
+    # Only local/worldwide/relocation are enriched & scored (saves tokens).
+    "location_status": "TEXT",
 }
 
 
@@ -399,6 +409,15 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     }
 
     where = conditions.get(stage, "1=1")
+    # Excluded jobs (dashboard or blocklist) never count as actionable work.
+    if stage not in ("applied",):
+        where = f"({where}) AND COALESCE(excluded, 0) = 0"
+    # Only spend enrichment + LLM scoring on location-eligible jobs (worldwide /
+    # local / relocation). Region-locked is excluded above; "unknown" jobs are
+    # parked — visible in the dashboard but not auto-processed (saves tokens).
+    # Use the dashboard "Enrich" button to process a parked job on demand.
+    if stage in ("pending_detail", "pending_score", "pending_tailor"):
+        where += " AND location_status IN ('local', 'worldwide', 'relocation', 'override')"
     params: list = []
 
     if "?" in where and min_score is not None:
@@ -421,4 +440,98 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if rows:
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Exclusion (dashboard + keyword blocklist)
+# ---------------------------------------------------------------------------
+
+def set_excluded(url: str, excluded: bool, reason: str = "manual",
+                 conn: sqlite3.Connection | None = None) -> None:
+    """Mark a single job excluded (or restore it). Excluded jobs are skipped by
+    scoring, tailoring, and apply."""
+    if conn is None:
+        conn = get_connection()
+    conn.execute(
+        "UPDATE jobs SET excluded = ?, excluded_reason = ? WHERE url = ?",
+        (1 if excluded else 0, reason if excluded else None, url),
+    )
+    conn.commit()
+
+
+def bypass_region_locked(conn: sqlite3.Connection | None = None,
+                         today_only: bool = False,
+                         strategy: str | None = None) -> int:
+    """Un-exclude region-locked jobs so they flow through scoring/tailoring.
+
+    Flips region-locked rows (location_status='region_locked', excluded for a
+    "location:..." reason) to the eligible "override" status with excluded=0.
+    Only touches location exclusions — manual/blocklist exclusions are left alone.
+
+    Args:
+        today_only: Restrict to jobs discovered today.
+        strategy:   Restrict to one discovery strategy (e.g. "linkedin_alert").
+
+    Returns the number of jobs un-excluded.
+    """
+    if conn is None:
+        conn = get_connection()
+    where = ["location_status = 'region_locked'", "COALESCE(excluded,0) = 1",
+             "COALESCE(excluded_reason,'') LIKE 'location:%'"]
+    params: list = []
+    if today_only:
+        where.append("date(discovered_at) = date('now')")
+    if strategy:
+        where.append("strategy = ?")
+        params.append(strategy)
+    cur = conn.execute(
+        "UPDATE jobs SET location_status = 'override', excluded = 0, excluded_reason = NULL "
+        "WHERE " + " AND ".join(where),
+        params,
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def apply_blocklist(title_terms: list[str], company_terms: list[str],
+                    conn: sqlite3.Connection | None = None) -> int:
+    """Mark jobs excluded when their title/company contains a blocklisted term.
+
+    Case-insensitive substring match. Only flips not-yet-excluded jobs (so a
+    manual restore isn't undone unless the term still matches). Returns the
+    number of jobs newly excluded.
+    """
+    if conn is None:
+        conn = get_connection()
+    n = 0
+    for field, terms in (("title", title_terms), ("site", company_terms)):
+        for term in terms:
+            t = (term or "").strip().lower()
+            if not t:
+                continue
+            cur = conn.execute(
+                f"UPDATE jobs SET excluded = 1, excluded_reason = ? "
+                f"WHERE COALESCE(excluded,0) = 0 AND LOWER({field}) LIKE ?",
+                (f"blocklist:{field}:{t}", f"%{t}%"),
+            )
+            n += cur.rowcount
+    conn.commit()
+    return n
+
+
+def get_all_jobs(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Return every job (all stages, including excluded) for the dashboard."""
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT url, title, salary, location, site, company, application_url, "
+        "full_description, fit_score, score_reasoning, tailored_resume_path, "
+        "cover_letter_path, applied_at, apply_status, "
+        "COALESCE(excluded,0) AS excluded, excluded_reason, location_status "
+        "FROM jobs ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    ).fetchall()
+    if rows:
+        cols = rows[0].keys()
+        return [dict(zip(cols, r)) for r in rows]
     return []
